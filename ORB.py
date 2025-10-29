@@ -222,6 +222,128 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
             # One trade per day
             if executed:
                 break
+        
+        # --- Fallback: If ORB not executed, 10:00 entry with OR-based SL and 1.5R ---
+        if not executed:
+            ten_am = pd.to_datetime(f"{date} 10:00:00").tz_localize(df.index.tz)
+            # Find the 10:00 bar (or next available minute at/after 10:00)
+            if ten_am in daily_data.index:
+                entry_time = ten_am
+            else:
+                # next available index at/after 10:00
+                later_slice = daily_data.loc[ten_am:]
+                if later_slice.empty:
+                    continue
+                entry_time = later_slice.index[0]
+
+            # Determine direction: align with prior day trend if available
+            position_type = None
+            # Compute VWAP from 09:30 to 09:59
+            vwap_start = pd.to_datetime(f"{date} 09:30:00").tz_localize(df.index.tz)
+            vwap_end = pd.to_datetime(f"{date} 09:59:00").tz_localize(df.index.tz)
+            vwap_slice = daily_data.loc[vwap_start:vwap_end]
+            if vwap_slice.empty or vwap_slice['Volume'].sum() <= 0:
+                continue
+            tp = (vwap_slice['High'] + vwap_slice['Low'] + vwap_slice['Close']) / 3.0
+            vwap_val = float((tp * vwap_slice['Volume']).sum() / vwap_slice['Volume'].sum())
+
+            if REQUIRE_PREV_DAY_TREND_ALIGNMENT and (prior_trend is not None):
+                bar_10 = daily_data.loc[entry_time]
+                entry_price = float(bar_10['Open'])
+                if (prior_trend == 'Up') and (entry_price > vwap_val):
+                    position_type = 'Long'
+                elif (prior_trend == 'Down') and (entry_price < vwap_val):
+                    position_type = 'Short'
+                else:
+                    position_type = None
+            elif not REQUIRE_PREV_DAY_TREND_ALIGNMENT:
+                # If not enforcing alignment, still use VWAP as bias
+                bar_10 = daily_data.loc[entry_time]
+                entry_price = float(bar_10['Open'])
+                position_type = 'Long' if entry_price > vwap_val else 'Short'
+            else:
+                # Alignment required but unknown trend
+                continue
+
+            if position_type is None:
+                continue
+
+            entry_price = float(daily_data.loc[entry_time]['Open'])
+            bar_10 = daily_data.loc[entry_time]
+            # Stop based on VWAP; 1.5R target
+            if position_type == 'Long':
+                stop_loss = vwap_val       # <--- THE FIX
+                risk = max(0.0, entry_price - stop_loss)
+                if risk <= 0:
+                    # This could happen if 10:00 open gaps below 9:59 VWAP
+                    continue 
+                take_profit = entry_price + 1.5 * risk
+            else: # Short
+                stop_loss = vwap_val       # <--- THE FIX
+                risk = max(0.0, stop_loss - entry_price)
+                if risk <= 0:
+                    continue
+                take_profit = entry_price - 1.5 * risk
+
+            # Exit scanning from entry_time to EOD
+            exits = daily_data.loc[entry_time:]
+            eod_exit_time = pd.to_datetime(f"{date} {TIME_EOD_EXIT_HOUR}:{TIME_EOD_EXIT_MINUTE}:00").tz_localize(df.index.tz)
+            exit_time = None
+            exit_price = None
+            for e_index, e_bar in exits.iterrows():
+                if position_type == 'Long':
+                    if e_bar['Low'] <= stop_loss:
+                        exit_time = e_index
+                        exit_price = stop_loss
+                        break
+                    if e_bar['High'] >= take_profit:
+                        exit_time = e_index
+                        exit_price = take_profit
+                        break
+                else:
+                    if e_bar['High'] >= stop_loss:
+                        exit_time = e_index
+                        exit_price = stop_loss
+                        break
+                    if e_bar['Low'] <= take_profit:
+                        exit_time = e_index
+                        exit_price = take_profit
+                        break
+                if e_index >= eod_exit_time:
+                    # Safety EOD close if neither TP nor SL triggered
+                    exit_time = e_index
+                    exit_price = e_bar['Close']
+                    break
+
+            if exit_price is not None:
+                # Position sizing with leverage: 10% equity * leverage
+                notional = LEVERAGE * 0.10 * current_equity
+                position_qty = notional / entry_price if entry_price > 0 else 0.0
+                point_pnl = (exit_price - entry_price) if position_type == 'Long' else (entry_price - exit_price)
+                dollar_pnl = point_pnl * position_qty
+                net_pnl = dollar_pnl - COMMISSION_ROUND_TURN
+
+                trades.append({
+                    'Date': date,
+                    'EntryTime': entry_time,
+                    'ExitTime': exit_time,
+                    'Position': position_type,
+                    'EntryPrice': entry_price,
+                    'ExitPrice': exit_price,
+                    'PositionQty': position_qty,
+                    'NotionalAtEntry': notional,
+                    'OR_High': or_high,
+                    'OR_Low': or_low,
+                    'StopLoss': stop_loss,
+                    'TakeProfit': take_profit,
+                    'PointPNL': point_pnl,
+                    'DollarPNL': dollar_pnl,
+                    'NetPNL': net_pnl,
+                    'Outcome': 'Win' if net_pnl > 0 else ('Loss' if net_pnl < -COMMISSION_ROUND_TURN else 'BreakEven'),
+                    'Risk': risk
+                })
+                executed = True
+                current_equity += net_pnl
 
     # --- 6. Performance Metrics to Output ---
     if not trades:
@@ -451,21 +573,16 @@ def build_equity_vs_index_plot(strategy_daily_equity: pd.DataFrame, spy_daily: p
             ie.index = ie.index.tz_convert(None)
         ie.index = ie.index.normalize()
     index_equity_daily = ie.groupby(ie.index).last()
-    # Plot as separate subplots for clarity
+    # Plot as separate subplots for clarity (use full available range)
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    # Limit both series to the last 60 days
-    latest_date = max(strategy_series.index.max(), index_equity_daily.index.max())
-    cutoff_date = latest_date - pd.Timedelta(days=60)
-    strategy_series_60 = strategy_series[strategy_series.index >= cutoff_date]
-    index_equity_60 = index_equity_daily[index_equity_daily.index >= cutoff_date]
 
-    # Strategy
-    ax1.plot(strategy_series_60.index, strategy_series_60, color='tab:blue', linewidth=2)
+    # Strategy (full range)
+    ax1.plot(strategy_series.index, strategy_series, color='tab:blue', linewidth=2)
     ax1.set_title('Strategy Equity (ORB)')
     ax1.set_ylabel('Equity ($)')
     ax1.grid(True, alpha=0.3)
-    # SPY Buy & Hold
-    ax2.plot(index_equity_60.index, index_equity_60, color='tab:green', linewidth=2)
+    # SPY Buy & Hold (aligned full range)
+    ax2.plot(index_equity_daily.index, index_equity_daily, color='tab:green', linewidth=2)
     ax2.set_title('SPY Buy & Hold (invested at start)')
     ax2.set_xlabel('Date')
     ax2.set_ylabel('Equity ($)')
@@ -490,8 +607,16 @@ if __name__ == "__main__":
         print("Backtest Results:")
         print(results)
 
-        # Fetch SPY daily closes for benchmark across the same period
-        spy_daily = load_spy_daily_yf(start_dt, end_dt)
+        print("\n--- Verifying First 5 Trades ---")
+        print(trades_df.head(5)[['Date', 'EntryTime', 'StopLoss', 'Risk', 'NetPNL']])
+
+        # Fetch SPY daily closes for benchmark matching the strategy equity range
+        if not daily_equity.empty:
+            de_start = pd.to_datetime(daily_equity.index.min())
+            de_end = pd.to_datetime(daily_equity.index.max()) + pd.Timedelta(days=1)
+            spy_daily = load_spy_daily_yf(de_start, de_end)
+        else:
+            spy_daily = load_spy_daily_yf(start_dt, end_dt)
         if spy_daily.empty:
             print("Failed to load SPY daily data for benchmark plot.")
         else:
