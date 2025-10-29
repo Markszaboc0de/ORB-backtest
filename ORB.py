@@ -119,17 +119,11 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
                 if short_breakout and prior_trend != 'Down':
                     continue
 
-            # Engulfing (same-direction) on next candle
-            b0_low = body_low(b0['Open'], b0['Close'])
-            b0_high = body_high(b0['Open'], b0['Close'])
-
+            # Confirmation (same-direction) on next candle
             if long_breakout:
-                # Bullish engulfing candle: bullish and body covers previous body
+                # Bullish confirmation: next candle closes above its open
                 bullish = b1['Close'] > b1['Open']
-                b1_low = body_low(b1['Open'], b1['Close'])
-                b1_high = body_high(b1['Open'], b1['Close'])
-                engulf = bullish and (b1_low <= b0_low) and (b1_high >= b0_high)
-                if not engulf:
+                if not bullish:
                     continue
                 position_type = 'Long'
                 entry_time = t2
@@ -140,12 +134,9 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
                     continue
                 take_profit = entry_price + RISK_REWARD_RATIO * risk
             else:
-                # Short: bearish engulfing candle
+                # Bearish confirmation: next candle closes below its open
                 bearish = b1['Close'] < b1['Open']
-                b1_low = body_low(b1['Open'], b1['Close'])
-                b1_high = body_high(b1['Open'], b1['Close'])
-                engulf = bearish and (b1_low <= b0_low) and (b1_high >= b0_high)
-                if not engulf:
+                if not bearish:
                     continue
                 position_type = 'Short'
                 entry_time = t2
@@ -236,7 +227,7 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
                     continue
                 entry_time = later_slice.index[0]
 
-            # Determine direction: align with prior day trend if available
+            # Determine direction: only allow Long if prior_trend == 'Up' and price > VWAP
             position_type = None
             # Compute VWAP from 09:30 to 09:59
             vwap_start = pd.to_datetime(f"{date} 09:30:00").tz_localize(df.index.tz)
@@ -252,15 +243,13 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
                 entry_price = float(bar_10['Open'])
                 if (prior_trend == 'Up') and (entry_price > vwap_val):
                     position_type = 'Long'
-                elif (prior_trend == 'Down') and (entry_price < vwap_val):
-                    position_type = 'Short'
                 else:
                     position_type = None
             elif not REQUIRE_PREV_DAY_TREND_ALIGNMENT:
-                # If not enforcing alignment, still use VWAP as bias
+                # If not enforcing alignment, still require price > VWAP for Long entries
                 bar_10 = daily_data.loc[entry_time]
                 entry_price = float(bar_10['Open'])
-                position_type = 'Long' if entry_price > vwap_val else 'Short'
+                position_type = 'Long' if entry_price > vwap_val else None
             else:
                 # Alignment required but unknown trend
                 continue
@@ -270,20 +259,13 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
 
             entry_price = float(daily_data.loc[entry_time]['Open'])
             bar_10 = daily_data.loc[entry_time]
-            # Stop based on VWAP; 1.5R target
-            if position_type == 'Long':
-                stop_loss = vwap_val       # <--- THE FIX
-                risk = max(0.0, entry_price - stop_loss)
-                if risk <= 0:
-                    # This could happen if 10:00 open gaps below 9:59 VWAP
-                    continue 
-                take_profit = entry_price + 1.5 * risk
-            else: # Short
-                stop_loss = vwap_val       # <--- THE FIX
-                risk = max(0.0, stop_loss - entry_price)
-                if risk <= 0:
-                    continue
-                take_profit = entry_price - 1.5 * risk
+            # Stop based on OR low; no take profit (hold to EOD or SL)
+            stop_loss = float(or_low)
+            risk = max(0.0, entry_price - stop_loss)
+            if risk <= 0:
+                # Could happen if 10:00 open <= OR low
+                continue 
+            take_profit = np.nan
 
             # Exit scanning from entry_time to EOD
             exits = daily_data.loc[entry_time:]
@@ -291,26 +273,13 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
             exit_time = None
             exit_price = None
             for e_index, e_bar in exits.iterrows():
-                if position_type == 'Long':
-                    if e_bar['Low'] <= stop_loss:
-                        exit_time = e_index
-                        exit_price = stop_loss
-                        break
-                    if e_bar['High'] >= take_profit:
-                        exit_time = e_index
-                        exit_price = take_profit
-                        break
-                else:
-                    if e_bar['High'] >= stop_loss:
-                        exit_time = e_index
-                        exit_price = stop_loss
-                        break
-                    if e_bar['Low'] <= take_profit:
-                        exit_time = e_index
-                        exit_price = take_profit
-                        break
+                # Only two exits: stop at OR low or EOD close
+                if e_bar['Low'] <= stop_loss:
+                    exit_time = e_index
+                    exit_price = stop_loss
+                    break
                 if e_index >= eod_exit_time:
-                    # Safety EOD close if neither TP nor SL triggered
+                    # EOD close if stop not hit
                     exit_time = e_index
                     exit_price = e_bar['Close']
                     break
@@ -327,7 +296,7 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
                     'Date': date,
                     'EntryTime': entry_time,
                     'ExitTime': exit_time,
-                    'Position': position_type,
+                    'Position': 'Long',
                     'EntryPrice': entry_price,
                     'ExitPrice': exit_price,
                     'PositionQty': position_qty,
@@ -620,4 +589,36 @@ if __name__ == "__main__":
         if spy_daily.empty:
             print("Failed to load SPY daily data for benchmark plot.")
         else:
+            # Print returns before plotting
+            try:
+                # Strategy return over the plotted period
+                if not daily_equity.empty and 'StrategyEquity' in daily_equity.columns:
+                    strat_start_equity = float(daily_equity['StrategyEquity'].iloc[0])
+                    strat_end_equity = float(daily_equity['StrategyEquity'].iloc[-1])
+                else:
+                    strat_start_equity = float(10000.0)
+                    strat_end_equity = strat_start_equity
+                strat_ret_pct = (strat_end_equity / strat_start_equity - 1.0) * 100.0
+
+                # SPY buy & hold return over the same period
+                spy_df = spy_daily.copy()
+                if isinstance(spy_df, pd.Series):
+                    spy_close = spy_df
+                else:
+                    if 'SPY_Close' in spy_df.columns:
+                        spy_close = spy_df['SPY_Close']
+                    elif 'Close' in spy_df.columns:
+                        spy_close = spy_df['Close']
+                    else:
+                        # Fallback: first column
+                        spy_close = spy_df.iloc[:, 0]
+                spy_close = spy_close.dropna()
+                spy_start = float(spy_close.iloc[0])
+                spy_end = float(spy_close.iloc[-1])
+                spy_ret_pct = (spy_end / spy_start - 1.0) * 100.0
+
+                print(f"Strategy Return over period: {strat_ret_pct:.2f}%")
+                print(f"SPY Buy & Hold Return over period: {spy_ret_pct:.2f}%")
+            except Exception as e:
+                print(f"Warning: failed to compute returns: {e}")
             build_equity_vs_index_plot(daily_equity, spy_daily, initial_capital=10000.0)
