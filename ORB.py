@@ -31,6 +31,9 @@ TIME_STOP_HOUR = 10
 TIME_STOP_MINUTE = 30
 TIME_EOD_EXIT_HOUR = 15
 TIME_EOD_EXIT_MINUTE = 50
+DAILY_MAX_LOSSES = 2  # Stop trading for the day after this many losses
+REQUIRE_PREV_DAY_TREND_ALIGNMENT = True  # Only trade with prior day's trend
+LEVERAGE = 10.0  # Apply 10x leverage to each trade's notional
 
 # Range filter parameters
 RANGE_FILTER_MIN = 0.0005  # unused in engulfing version
@@ -43,6 +46,11 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
     df['Date'] = df.index.date
     trades = [] # List to store trade outcomes
     
+    # Precompute an ordered list of trading dates for prior-day lookup
+    unique_dates = list(pd.unique(df['Date']))
+    # Track current equity for position sizing (10% per day)
+    current_equity = float(initial_capital)
+    
     for date, daily_data in df.groupby('Date'):
         # --- 1. Opening Range (first 5 minutes 9:30-9:34) ---
         orb_start = pd.to_datetime(f"{date} 09:30:00").tz_localize(df.index.tz)
@@ -52,6 +60,26 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
             continue
         or_high = orb_data['High'].max()
         or_low = orb_data['Low'].min()
+
+        # --- Prev-day trend filter ---
+        prior_trend = None  # 'Up' or 'Down' or None if unavailable/flat
+        if REQUIRE_PREV_DAY_TREND_ALIGNMENT:
+            try:
+                current_idx = unique_dates.index(date)
+                if current_idx > 0:
+                    prev_date = unique_dates[current_idx - 1]
+                    prev_day_data = df[df['Date'] == prev_date]
+                    if not prev_day_data.empty:
+                        prev_open = float(prev_day_data['Open'].iloc[0])
+                        prev_close = float(prev_day_data['Close'].iloc[-1])
+                        if prev_close > prev_open:
+                            prior_trend = 'Up'
+                        elif prev_close < prev_open:
+                            prior_trend = 'Down'
+                        else:
+                            prior_trend = None
+            except ValueError:
+                prior_trend = None
 
         # --- 2. Engulfing Breakout Entry (scan post 9:35 close) ---
         scan_start = pd.to_datetime(f"{date} 09:36:00").tz_localize(df.index.tz)
@@ -64,6 +92,7 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
             return max(open_price, close_price)
 
         executed = False
+        losses_today = 0
 
         # Iterate with window of 3 candles: breakout (i), engulf (i+1), entry on open of (i+2)
         bars = day_after_orb.copy()
@@ -82,6 +111,13 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
 
             if not (long_breakout or short_breakout):
                 continue
+
+            # Prev-day trend direction alignment (if required)
+            if REQUIRE_PREV_DAY_TREND_ALIGNMENT and prior_trend is not None:
+                if long_breakout and prior_trend != 'Up':
+                    continue
+                if short_breakout and prior_trend != 'Down':
+                    continue
 
             # Engulfing (same-direction) on next candle
             b0_low = body_low(b0['Open'], b0['Close'])
@@ -151,8 +187,11 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
                         break
 
             if exit_price is not None:
+                # Position sizing with leverage: trade 10% of equity times leverage
+                notional = LEVERAGE * 0.10 * current_equity
+                position_qty = notional / entry_price if entry_price > 0 else 0.0
                 point_pnl = (exit_price - entry_price) if position_type == 'Long' else (entry_price - exit_price)
-                dollar_pnl = point_pnl
+                dollar_pnl = point_pnl * position_qty
                 net_pnl = dollar_pnl - COMMISSION_ROUND_TURN
 
                 trades.append({
@@ -162,6 +201,8 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
                     'Position': position_type,
                     'EntryPrice': entry_price,
                     'ExitPrice': exit_price,
+                    'PositionQty': position_qty,
+                    'NotionalAtEntry': notional,
                     'OR_High': or_high,
                     'OR_Low': or_low,
                     'StopLoss': stop_loss,
@@ -172,7 +213,12 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
                     'Outcome': 'Win' if net_pnl > 0 else ('Loss' if net_pnl < -COMMISSION_ROUND_TURN else 'BreakEven'),
                     'Risk': risk
                 })
+                # Track daily loss count for potential daily stop (future multi-trade support)
+                if net_pnl < 0:
+                    losses_today += 1
                 executed = True
+                # Update current equity after trade closes
+                current_equity += net_pnl
             # One trade per day
             if executed:
                 break
