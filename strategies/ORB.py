@@ -2,31 +2,8 @@ import os
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 
-try:
-    import yfinance as yf
-except Exception:  # yfinance optional; handled at runtime
-    yf = None
-
-from backtesting import data_loading, visualization
-
-# --- 1. Data Loading and Setup (Conceptual) ---
-# ASSUME: 'df' is a pandas DataFrame with 1-minute data
-# Index must be a datetime object (localized to EST or UTC/EST-aware)
-# Columns: ['Open', 'High', 'Low', 'Close', 'Volume']
-# For demonstration, we'll assume the index is the trading date and time.
-#
-# Example Data Loading (You would replace this with actual data loading)
-# data = {
-#     'DateTime': pd.to_datetime(['2024-01-02 09:30:00', ..., '2024-01-02 16:00:00', ...]),
-#     'Open': [...], 'High': [...], 'Low': [...], 'Close': [...], 'Volume': [...]
-# }
-# df = pd.DataFrame(data).set_index('DateTime')
-# df = df.tz_localize('EST') # Ensure timezone is correct
-
-# --- 2. Configuration and Constants ---
-# Strategy parameters
+# TODO: incorporate these as parameters of the strategy
 COMMISSION_ROUND_TURN = 2.00
 RISK_REWARD_RATIO = 3.0
 TIME_STOP_HOUR = 10
@@ -36,23 +13,11 @@ TIME_EOD_EXIT_MINUTE = 50
 DAILY_MAX_LOSSES = 2  # Stop trading for the day after this many losses
 REQUIRE_PREV_DAY_TREND_ALIGNMENT = True  # Only trade with prior day's trend
 LEVERAGE = 10.0  # Apply 10x leverage to each trade's notional
-
-# Range filter parameters
 RANGE_FILTER_MIN = 0.0005  # unused in engulfing version
 RANGE_FILTER_MAX = 0.0100  # unused in engulfing version
 
-# --- 3. Core Strategy Backtest Function ---
+def orb_strategy(df: pd.DataFrame):
 
-def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, return_trades: bool = False):
-    # Prepare the DataFrame for backtesting
-    df['Date'] = df.index.date
-    trades = [] # List to store trade outcomes
-    
-    # Precompute an ordered list of trading dates for prior-day lookup
-    unique_dates = list(pd.unique(df['Date']))
-    # Track current equity for position sizing (10% per day)
-    current_equity = float(initial_capital)
-    
     for date, daily_data in df.groupby('Date'):
         # --- 1. Opening Range (first 5 minutes 9:30-9:34) ---
         orb_start = pd.to_datetime(f"{date} 09:30:00").tz_localize(df.index.tz)
@@ -277,35 +242,6 @@ def backtest_orb_strategy(df: pd.DataFrame, initial_capital: float = 10000.0, re
         "Commission per Round-Turn ($)": COMMISSION_ROUND_TURN
     }
     
-    if not return_trades:
-        return results
-    
     # Build equity curve (trade-by-trade, sequential, 1 unit position sizing)
     trades_df = trades_df.sort_values(by=['ExitTime']).copy()
-    trades_df['Equity'] = initial_capital + trades_df['NetPNL'].cumsum()
-    # Also compute a daily equity series using last known equity of each trade's exit date
-    daily_equity = trades_df.groupby('Date')['Equity'].last().to_frame(name='StrategyEquity')
-    return results, trades_df, daily_equity
-
-if __name__ == "__main__":
-    # Define a 1-year window ending today (NY)
-    today_ny = datetime.now(timezone.utc).astimezone()
-    end_dt = today_ny
-    start_dt = end_dt - timedelta(days=365)
-
-    print("Fetching SPY minute data (tries Polygon 1m, falls back to yfinance 5m/60d)...")
-    minute_df = data_loading.fetch_minute_data_one_year(start_dt, end_dt)
-    if minute_df.empty:
-        print("Failed to load intraday SPY data. Provide POLYGON_API_KEY for full 1y minute bars.")
-    else:
-        # Backtest the ORB strategy; return trades and daily equity
-        results, trades_df, daily_equity = backtest_orb_strategy(minute_df, initial_capital=10000.0, return_trades=True)
-        print("Backtest Results:")
-        print(results)
-
-        # Fetch SPY daily closes for benchmark across the same period
-        spy_daily = data_loading.load_spy_daily_yf(start_dt, end_dt)
-        if spy_daily.empty:
-            print("Failed to load SPY daily data for benchmark plot.")
-        else:
-            visualization.build_equity_vs_index_plot(daily_equity, spy_daily, initial_capital=10000.0)
+    return results, trades_df
